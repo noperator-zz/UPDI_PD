@@ -105,26 +105,39 @@ class PDI:
         'p',
         '(rsv)',
     ]
+    # ctrl_reg_name = {
+    #     0: 'status',
+    #     1: 'reset',
+    #     2: 'ctrl',
+    # }
     ctrl_reg_name = {
-        0: 'status',
-        1: 'reset',
-        2: 'ctrl',
+        0: 'STATUS A',
+        1: 'STATUS B',
+        2: 'CTRL A',
+        3: 'CTRL B',
+        7: 'ASI KEY STATUS',
+        8: 'ASI RESET REQ',
+        9: 'ASI CTRL A',
+        10: 'ASI SYS CTRL A',
+        11: 'ASI SYS STAT',
+        12: 'ASI CRC STATUS'
     }
 
 class Decoder(srd.Decoder):
     api_version = 3
-    id = 'avr_pdi'
-    name = 'AVR PDI'
+    id = 'avr_updi'
+    name = 'AVR UPDI'
     longname = 'Atmel Program and Debug Interface'
     desc = 'Atmel ATxmega Program and Debug Interface (PDI) protocol.'
     license = 'gplv2+'
-    inputs = ['logic']
+    # inputs = ['logic']
+    inputs = ['uart']
     outputs = []
     tags = ['Debug/trace']
-    channels = (
-        {'id': 'reset', 'name': 'RESET', 'desc': 'RESET / PDI_CLK'},
-        {'id': 'data', 'name': 'DATA', 'desc': 'PDI_DATA'},
-    )
+    # channels = (
+    #     {'id': 'reset', 'name': 'RESET', 'desc': 'RESET / PDI_CLK'},
+    #     {'id': 'data', 'name': 'DATA', 'desc': 'PDI_DATA'},
+    # )
     annotations = (
         ('uart-bit', 'UART bit'),
         ('start-bit', 'Start bit'),
@@ -443,132 +456,18 @@ class Decoder(srd.Decoder):
         self.clear_insn()
         self.insn_rep_count = save_rep_count
 
-    def handle_bits(self, ss, es, bitval):
-        '''Handle a bit at the UART layer.'''
 
-        # Concentrate annotation literals here for easier maintenance.
-        ann_class_text = {
-            Ann.START: ['Start bit', 'Start', 'S'],
-            Ann.PARITY_OK: ['Parity OK', 'Par OK', 'P'],
-            Ann.PARITY_ERR: ['Parity error', 'Par ERR', 'PE'],
-            Ann.STOP_OK: ['Stop bit', 'Stop', 'T'],
-            Ann.STOP_ERR: ['Stop bit error', 'Stop ERR', 'TE'],
-            Ann.BREAK: ['Break condition', 'BREAK', 'BRK'],
-        }
-        def put_uart_field(bitpos, annclass):
-            self.put_ann_data(bitpos, [annclass, ann_class_text[annclass]])
+    def decode(self, ss, es, data):
+        try:
+            # debug_print("decode")
+            ptype, rxtx, pdata = data
 
-        # The number of bits which form one UART frame. Note that
-        # the decoder operates with only one stop bit.
-        frame_bitcount = 1 + 8 + 1 + 1
-
-        # Detect adjacent runs of all-zero bits. This is meant
-        # to cope when BREAK conditions appear at any arbitrary
-        # position, it need not be "aligned" to an UART frame.
-        if bitval == 1:
-            self.zero_count = 0
-        elif bitval == 0:
-            if not self.zero_count:
-                self.zero_ss = ss
-            self.zero_count += 1
-            if self.zero_count == frame_bitcount:
-                self.break_ss = self.zero_ss
-
-        # BREAK conditions are _at_minimum_ the length of a UART frame, but
-        # can span an arbitrary number of bit times. Track the "end sample"
-        # value of the last low bit we have seen, and emit the annotation only
-        # after the line went idle (high) again. Pass BREAK to the upper layer
-        # as well. When the line is low, BREAK still is pending. When the line
-        # is high, the current bit cannot be START, thus return from here.
-        if self.break_ss is not None:
-            if bitval == '0':
-                self.break_es = es
+            # Ignore unknown/unsupported ptypes.
+            # if ptype not in ('STARTBIT', 'DATA', 'STOPBIT'):
+            if ptype not in ('DATA'):
                 return
-            self.put(self.break_ss, self.break_es, self.out_ann,
-                     [Ann.BREAK, ann_class_text[Ann.BREAK]])
-            self.handle_byte(self.break_ss, self.break_es, None)
-            self.break_ss = None
-            self.break_es = None
-            self.bits = []
-            return
 
-        # Ignore high bits when waiting for START.
-        if not self.bits and bitval == 1:
-            return
+            self.handle_byte(ss, es, pdata[0])
 
-        # Store individual bits and their start/end sample numbers,
-        # until a complete frame was received.
-        self.bits.append(Bit(bitval, ss, es))
-        if len(self.bits) < frame_bitcount:
-            return
-
-        # Get individual fields of the UART frame.
-        bits_num = sum([b.val << pos for pos, b in enumerate(self.bits)])
-        if False:
-            # This logic could detect BREAK conditions which are aligned to
-            # UART frames. Which was obsoleted by the above detection at
-            # arbitrary positions. The code still can be useful to detect
-            # "other kinds of frame errors" which carry valid symbols for
-            # upper layers (the Atmel literature suggests "break", "delay",
-            # and "empty" symbols when PDI is communicated over different
-            # physical layers).
-            if bits_num == 0: # BREAK
-                self.break_ss = self.bits[0].ss
-                self.break_es = es
-                self.bits = []
-                return
-        start_bit = bits_num & 0x01; bits_num >>= 1
-        data_val = bits_num & 0xff; bits_num >>= 8
-        data_text = '{:02x}'.format(data_val)
-        parity_bit = bits_num & 0x01; bits_num >>= 1
-        stop_bit = bits_num & 0x01; bits_num >>= 1
-
-        # Check for frame errors. START _must_ have been low
-        # according to the above accumulation logic.
-        parity_ok = (bin(data_val).count('1') + parity_bit) % 2 == 0
-        stop_ok = stop_bit == 1
-        valid_frame = parity_ok and stop_ok
-
-        # Emit annotations.
-        for idx in range(frame_bitcount):
-            self.put_ann_bit(idx, Ann.BIT)
-        put_uart_field(0, Ann.START)
-        self.put(self.bits[1].ss, self.bits[8].es, self.out_ann,
-                 [Ann.DATA, ['Data: ' + data_text, 'D: ' + data_text, data_text]])
-        put_uart_field(9, Ann.PARITY_OK if parity_ok else Ann.PARITY_ERR)
-        put_uart_field(10, Ann.STOP_OK if stop_ok else Ann.STOP_ERR)
-
-        # Emit binary data stream. Have bytes interpreted at higher layers.
-        if valid_frame:
-            byte_ss, byte_es = self.bits[0].ss, self.bits[-1].es
-            self.put_bin_bytes(byte_ss, byte_es, Ann.BIN_BYTES, bytes([data_val]))
-            self.handle_byte(byte_ss, byte_es, data_val)
-
-        # Reset internal state for the next frame.
-        self.bits = []
-
-    def handle_clk_edge(self, clock_pin, data_pin):
-        # Sample the data line on rising clock edges. Always, for TX and for
-        # RX bytes alike.
-        if clock_pin == 1:
-            self.data_sample = data_pin
-            return
-
-        # Falling clock edges are boundaries for bit slots. Inspect previously
-        # sampled bits on falling clock edges, when the start and end sample
-        # numbers were determined. Only inspect bit slots of known clock
-        # periods (avoid interpreting the DATA line when the "enabled" state
-        # has not yet been determined).
-        self.ss_last_fall = self.ss_curr_fall
-        self.ss_curr_fall = self.samplenum
-        if self.ss_last_fall is None:
-            return
-
-        # Have the past bit slot processed.
-        bit_ss, bit_es = self.ss_last_fall, self.ss_curr_fall
-        bit_val = self.data_sample
-        self.handle_bits(bit_ss, bit_es, bit_val)
-
-    def decode(self):
-        while True:
-            self.handle_clk_edge(*self.wait({0: 'e'}))
+        except Exception as e:
+            pass
