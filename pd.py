@@ -237,6 +237,10 @@ class Decoder(srd.Decoder):
             self.insn_rep_count = 0
             # Will FALLTHROUGH to "end of instruction" below.
 
+
+        if not self.insn_dat_count and byteval in [0, 0x55]:
+            return
+
         # Decode instruction opcodes and argument sizes
         # from the first byte of a transaction.
         if self.insn_opcode is None and not is_break:
